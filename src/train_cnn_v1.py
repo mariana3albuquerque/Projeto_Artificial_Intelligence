@@ -220,6 +220,32 @@ def save_history_plot(history: keras.callbacks.History, output_dir: Path) -> Non
     plt.close()
 
 
+def save_compact_history_plot(history: keras.callbacks.History, output_dir: Path) -> None:
+    hist = pd.DataFrame(history.history)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].plot(hist["loss"], label="Train", linewidth=2)
+    axes[0].plot(hist["val_loss"], label="Val", linewidth=2)
+    axes[0].set_xlabel("Epoch", fontsize=12)
+    axes[0].set_ylabel("Loss", fontsize=12)
+    axes[0].set_title("Training Loss", fontsize=14, fontweight="bold")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(hist["accuracy"], label="Train", linewidth=2)
+    axes[1].plot(hist["val_accuracy"], label="Val", linewidth=2)
+    axes[1].set_xlabel("Epoch", fontsize=12)
+    axes[1].set_ylabel("Accuracy", fontsize=12)
+    axes[1].set_title("Accuracy", fontsize=14, fontweight="bold")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    fig.suptitle("HAM10000 Training History", fontsize=16, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(output_dir / "training_history_compact_v1.png", dpi=200)
+    plt.close(fig)
+
+
 def save_confusion_matrix(cm: np.ndarray, class_names: List[str], output_dir: Path) -> None:
     fig, ax = plt.subplots(figsize=(9, 7))
     im = ax.imshow(cm, cmap="Blues")
@@ -371,6 +397,7 @@ def main() -> None:
     )
 
     save_history_plot(history, config.output_dir)
+    save_compact_history_plot(history, config.output_dir)
 
     metrics = evaluate_model(
         model=model,

@@ -141,6 +141,7 @@ Saidas esperadas em `reports/model_v1/`:
 - `confusion_matrix_v1.csv` (matriz numerica)
 - `confusion_matrix_v1.png` (matriz visual)
 - `training_history_v1.png` (curvas de treino)
+- `training_history_compact_v1.png` (grafico compacto com loss e accuracy)
 
 ## Metricas criticas de avaliacao
 
