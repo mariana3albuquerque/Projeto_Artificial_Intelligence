@@ -1,0 +1,8 @@
+dx,dx_name,count,percentage
+nv,Melanocytic nevi,6705,66.95
+mel,Melanoma,1113,11.11
+bkl,Benign keratosis-like lesions,1099,10.97
+bcc,Basal cell carcinoma,514,5.13
+akiec,Actinic keratoses / intraepithelial carcinoma,327,3.27
+vasc,Vascular lesions,142,1.42
+df,Dermatofibroma,115,1.15
