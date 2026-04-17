@@ -80,7 +80,80 @@ python src/test_loader.py \
   --batch-size 8
 ```
 
+No PowerShell (Windows), use:
+
+```powershell
+python src/test_loader.py `
+  --processed-csv data/processed/ham10000_processed.csv `
+  --image-size 224 224 `
+  --batch-size 8
+```
+
 Isso valida se o pipeline de carregamento e pré-processamento está funcionando.
+
+## Etapa 3 — Treinar modelo de classificacao (Pipeline 1.0)
+
+O baseline da Sprint 2 utiliza uma CNN simples com:
+- camada de entrada para pixels RGB
+- camadas convolucionais com kernels para extracao de caracteristicas
+- camada de saida com 7 nos (uma por classe do HAM10000)
+
+Comando:
+
+```bash
+python src/train_cnn_v1.py \
+  --processed-csv data/processed/ham10000_processed.csv \
+  --output-dir reports/model_v1 \
+  --image-size 128 128 \
+  --batch-size 32 \
+  --epochs 25 \
+  --learning-rate 0.001 \
+  --seed 42 \
+  --melanoma-boost 1.5
+```
+
+No PowerShell (Windows), use:
+
+```powershell
+python src/train_cnn_v1.py `
+  --processed-csv data/processed/ham10000_processed.csv `
+  --output-dir reports/model_v1 `
+  --image-size 128 128 `
+  --batch-size 32 `
+  --epochs 25 `
+  --learning-rate 0.001 `
+  --seed 42 `
+  --melanoma-boost 1.5
+```
+
+Tambem funciona em uma unica linha no PowerShell:
+
+```powershell
+python src/train_cnn_v1.py --processed-csv data/processed/ham10000_processed.csv --output-dir reports/model_v1 --image-size 128 128 --batch-size 32 --epochs 25 --learning-rate 0.001 --seed 42 --melanoma-boost 1.5
+```
+
+O script reaproveita o split estratificado criado na Sprint 1 (train/val/test).
+
+Saidas esperadas em `reports/model_v1/`:
+- `cnn_ham10000_v1.keras` (modelo treinado)
+- `metrics_v1.json` (metricas agregadas)
+- `classification_report_v1.csv` (precision/recall/f1 por classe)
+- `confusion_matrix_v1.csv` (matriz numerica)
+- `confusion_matrix_v1.png` (matriz visual)
+- `training_history_v1.png` (curvas de treino)
+
+## Metricas criticas de avaliacao
+
+Prioridade clinica:
+- Recall (sensibilidade), com destaque para recall da classe melanoma (`mel`)
+
+Metricas complementares:
+- Precision
+- F1-score
+- ROC-AUC (multiclasse OVR)
+
+Analise qualitativa:
+- Matriz de confusao para identificar classes mais confundidas
 
 ## Classes do dataset
 
