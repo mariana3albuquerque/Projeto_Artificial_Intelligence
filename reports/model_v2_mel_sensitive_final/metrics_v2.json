@@ -1,0 +1,15 @@
+{
+  "accuracy": 0.7045908183632734,
+  "recall_macro": 0.6358412678810368,
+  "recall_weighted": 0.7045908183632734,
+  "precision_macro": 0.6655050100057609,
+  "precision_weighted": 0.8143247267650882,
+  "f1_macro": 0.6262296524357982,
+  "f1_weighted": 0.7339370317541974,
+  "roc_auc_ovr_macro": 0.9405627868381414,
+  "roc_auc_ovr_weighted": 0.9317781372914109,
+  "recall_melanoma": 0.7485029940119761,
+  "precision_melanoma": 0.3324468085106383,
+  "f1_melanoma": 0.4604051565377532,
+  "melanoma_threshold": 0.36
+}
