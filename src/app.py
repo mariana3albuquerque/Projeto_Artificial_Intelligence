@@ -15,8 +15,21 @@ from tensorflow import keras
 # Configurações principais
 # ============================================================
 
-DEFAULT_MODEL_PATH = Path("reports/model_v2_mel_sensitive/cnn_ham10000_v2.keras")
-DEFAULT_POLICY_PATH = Path("reports/model_v2_mel_sensitive/decision_policy_v2.json")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+DEFAULT_MODEL_PATH = (
+    PROJECT_ROOT
+    / "reports"
+    / "model_v2_mel_sensitive_final"
+    / "cnn_ham10000_v2.keras"
+)
+
+DEFAULT_POLICY_PATH = (
+    PROJECT_ROOT
+    / "reports"
+    / "model_v2_mel_sensitive_final"
+    / "decision_policy_v2.json"
+)
 
 IMAGE_SIZE = (224, 224)
 
@@ -40,6 +53,16 @@ CLASS_DESCRIPTIONS: Dict[str, str] = {
     "vasc": "Vascular lesions",
 }
 
+CLASS_DESCRIPTIONS_PT: Dict[str, str] = {
+    "akiec": "Queratose actínica / carcinoma intraepitelial",
+    "bcc": "Carcinoma basocelular",
+    "bkl": "Lesão benigna semelhante à queratose",
+    "df": "Dermatofibroma",
+    "mel": "Melanoma",
+    "nv": "Nevo melanocítico",
+    "vasc": "Lesão vascular",
+}
+
 DEFAULT_MELANOMA_THRESHOLD = 0.36
 
 
@@ -48,7 +71,7 @@ DEFAULT_MELANOMA_THRESHOLD = 0.36
 # ============================================================
 
 @st.cache_resource
-def load_model(model_path: str) -> keras.Model:
+def load_trained_model(model_path: str) -> keras.Model:
     """
     Carrega o modelo treinado da Sprint 3.
     O cache evita recarregar o modelo a cada interação da interface.
@@ -65,7 +88,7 @@ def load_model(model_path: str) -> keras.Model:
 def load_decision_policy(policy_path: Path) -> Dict[str, float]:
     """
     Carrega a política de decisão, incluindo o threshold de melanoma.
-    Caso o arquivo não exista, usa o threshold padrão.
+    Caso o arquivo não exista, utiliza o threshold padrão.
     """
     if not policy_path.exists():
         return {"melanoma_threshold": DEFAULT_MELANOMA_THRESHOLD}
@@ -73,7 +96,12 @@ def load_decision_policy(policy_path: Path) -> Dict[str, float]:
     try:
         with policy_path.open("r", encoding="utf-8") as file:
             policy = json.load(file)
+
+        if "melanoma_threshold" not in policy:
+            policy["melanoma_threshold"] = DEFAULT_MELANOMA_THRESHOLD
+
         return policy
+
     except Exception:
         return {"melanoma_threshold": DEFAULT_MELANOMA_THRESHOLD}
 
@@ -82,11 +110,9 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
     """
     Pré-processa a imagem enviada pelo usuário.
 
-    Importante:
-    O modelo v2 foi treinado com imagens redimensionadas para 224x224.
-    A normalização/preprocessamento específico da EfficientNet já está dentro
-    do próprio modelo, caso o modelo tenha sido salvo com essa camada.
-    Por isso, aqui mantemos os pixels em escala 0-255 como float32.
+    O modelo v2 foi treinado com imagens RGB redimensionadas para 224x224.
+    A camada de preprocessamento da EfficientNet foi incluída no modelo treinado,
+    então aqui mantemos os pixels em escala 0-255 como float32.
     """
     image = image.convert("RGB")
     image = image.resize(IMAGE_SIZE)
@@ -103,14 +129,17 @@ def predict_image(
     melanoma_threshold: float,
 ) -> Tuple[str, float, Dict[str, float], str, float]:
     """
+    Executa a predição e aplica a regra melanoma-sensitive.
+
     Retorna:
-    - classe final após aplicar threshold melanoma-sensitive;
+    - classe final após aplicar threshold;
     - probabilidade da classe final;
     - probabilidades por classe;
     - classe original pelo argmax;
     - probabilidade de melanoma.
     """
     input_array = preprocess_image(image)
+
     probabilities = model.predict(input_array, verbose=0)[0]
 
     probs_by_class = {
@@ -137,14 +166,21 @@ def format_percentage(value: float) -> str:
     return f"{value * 100:.2f}%"
 
 
-def get_risk_message(final_class: str, melanoma_prob: float, threshold: float) -> str:
+def get_triage_message(
+    final_class: str,
+    melanoma_prob: float,
+    melanoma_threshold: float,
+) -> str:
+    """
+    Gera uma interpretação simples para o usuário.
+    """
     if final_class == "mel":
         return (
             "A imagem foi marcada como suspeita para melanoma pela regra "
             "melanoma-sensitive. Recomenda-se avaliação médica especializada."
         )
 
-    if melanoma_prob >= threshold * 0.75:
+    if melanoma_prob >= melanoma_threshold * 0.75:
         return (
             "A probabilidade de melanoma não ultrapassou o threshold final, "
             "mas ficou relativamente próxima. Recomenda-se cautela na triagem."
@@ -154,6 +190,36 @@ def get_risk_message(final_class: str, melanoma_prob: float, threshold: float) -
         "A imagem não foi marcada como melanoma pela regra de triagem. "
         "Mesmo assim, o resultado não substitui avaliação médica."
     )
+
+
+def render_class_probabilities(probs_by_class: Dict[str, float]) -> None:
+    """
+    Exibe as probabilidades por classe em ordem decrescente.
+    """
+    st.markdown("---")
+    st.markdown("## Probabilidades por classe")
+
+    sorted_probs = sorted(
+        probs_by_class.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    for class_name, prob in sorted_probs:
+        st.progress(float(prob))
+        st.write(
+            f"**{class_name}** — {CLASS_DESCRIPTIONS_PT[class_name]} "
+            f"({CLASS_DESCRIPTIONS[class_name]}): {format_percentage(prob)}"
+        )
+
+    st.markdown("---")
+    st.markdown("## Top 3 predições")
+
+    for rank, (class_name, prob) in enumerate(sorted_probs[:3], start=1):
+        st.write(
+            f"{rank}. **{class_name}** — {CLASS_DESCRIPTIONS_PT[class_name]} "
+            f"({format_percentage(prob)})"
+        )
 
 
 # ============================================================
@@ -186,8 +252,14 @@ não substitui dermatologistas e não deve ser usado como ferramenta clínica de
 """
 )
 
+# ============================================================
+# Sidebar
+# ============================================================
+
 with st.sidebar:
     st.header("Configurações")
+
+    st.markdown("### Caminhos")
 
     model_path = st.text_input(
         "Caminho do modelo treinado",
@@ -200,7 +272,11 @@ with st.sidebar:
     )
 
     policy = load_decision_policy(Path(policy_path_text))
-    loaded_threshold = float(policy.get("melanoma_threshold", DEFAULT_MELANOMA_THRESHOLD))
+    loaded_threshold = float(
+        policy.get("melanoma_threshold", DEFAULT_MELANOMA_THRESHOLD)
+    )
+
+    st.markdown("### Threshold")
 
     melanoma_threshold = st.slider(
         "Threshold melanoma-sensitive",
@@ -212,8 +288,15 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### Classes do modelo")
+
     for class_name in CLASS_NAMES:
-        st.write(f"**{class_name}** — {CLASS_DESCRIPTIONS[class_name]}")
+        st.write(
+            f"**{class_name}** — {CLASS_DESCRIPTIONS_PT[class_name]}"
+        )
+
+# ============================================================
+# Upload da imagem
+# ============================================================
 
 uploaded_file = st.file_uploader(
     "Envie uma imagem de lesão de pele",
@@ -222,19 +305,30 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is None:
     st.info("Envie uma imagem para executar a predição.")
+
 else:
     image = Image.open(uploaded_file)
 
     col1, col2 = st.columns([1, 1.2])
 
     with col1:
-        st.image(image, caption="Imagem enviada", use_container_width=True)
+        st.image(
+            image,
+            caption="Imagem enviada",
+            use_container_width=True,
+        )
 
     with col2:
         try:
-            model = load_model(model_path)
+            model = load_trained_model(model_path)
 
-            final_class, final_prob, probs_by_class, argmax_class, melanoma_prob = predict_image(
+            (
+                final_class,
+                final_prob,
+                probs_by_class,
+                argmax_class,
+                melanoma_prob,
+            ) = predict_image(
                 model=model,
                 image=image,
                 melanoma_threshold=melanoma_threshold,
@@ -244,7 +338,7 @@ else:
 
             st.metric(
                 label="Classe final",
-                value=f"{final_class} — {CLASS_DESCRIPTIONS[final_class]}",
+                value=f"{final_class} — {CLASS_DESCRIPTIONS_PT[final_class]}",
             )
 
             st.metric(
@@ -261,65 +355,57 @@ else:
 
             if melanoma_prob >= melanoma_threshold:
                 st.error(
-                    f"A probabilidade de melanoma foi {format_percentage(melanoma_prob)}, "
-                    f"acima do threshold de {format_percentage(melanoma_threshold)}. "
+                    f"A probabilidade de melanoma foi "
+                    f"{format_percentage(melanoma_prob)}, acima do threshold de "
+                    f"{format_percentage(melanoma_threshold)}. "
                     "A classe final foi ajustada para melanoma."
                 )
             else:
                 st.success(
-                    f"A probabilidade de melanoma foi {format_percentage(melanoma_prob)}, "
-                    f"abaixo do threshold de {format_percentage(melanoma_threshold)}."
+                    f"A probabilidade de melanoma foi "
+                    f"{format_percentage(melanoma_prob)}, abaixo do threshold de "
+                    f"{format_percentage(melanoma_threshold)}."
                 )
 
             st.markdown("### Interpretação")
-            st.write(get_risk_message(final_class, melanoma_prob, melanoma_threshold))
+
+            st.write(
+                get_triage_message(
+                    final_class=final_class,
+                    melanoma_prob=melanoma_prob,
+                    melanoma_threshold=melanoma_threshold,
+                )
+            )
 
             st.markdown("### Comparação com argmax normal")
+
             st.write(
-                f"A classe por maior probabilidade antes da regra melanoma-sensitive era: "
-                f"**{argmax_class} — {CLASS_DESCRIPTIONS[argmax_class]}**."
+                "A classe por maior probabilidade antes da regra "
+                f"melanoma-sensitive era: **{argmax_class} — "
+                f"{CLASS_DESCRIPTIONS_PT[argmax_class]}**."
             )
+
+            render_class_probabilities(probs_by_class)
 
         except Exception as exc:
             st.error("Não foi possível executar a predição.")
             st.exception(exc)
 
-    st.markdown("---")
-    st.markdown("## Probabilidades por classe")
-
-    sorted_probs = sorted(
-        probs_by_class.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-
-    for class_name, prob in sorted_probs:
-        st.progress(prob)
-        st.write(
-            f"**{class_name}** — {CLASS_DESCRIPTIONS[class_name]}: "
-            f"{format_percentage(prob)}"
-        )
-
-    st.markdown("---")
-    st.markdown("## Top 3 predições")
-
-    top_3 = sorted_probs[:3]
-
-    for rank, (class_name, prob) in enumerate(top_3, start=1):
-        st.write(
-            f"{rank}. **{class_name}** — {CLASS_DESCRIPTIONS[class_name]} "
-            f"({format_percentage(prob)})"
-        )
+# ============================================================
+# Observação metodológica
+# ============================================================
 
 st.markdown("---")
 
 st.markdown(
     """
-### Observação metodológica
+## Observação metodológica
 
-O modelo foi treinado inicialmente com o dataset HAM10000, composto por imagens
+O modelo foi treinado inicialmente com o dataset **HAM10000**, composto por imagens
 dermatoscópicas. Portanto, embora o projeto tenha como visão futura o uso com imagens
-de smartphone, esta versão ainda deve ser interpretada como uma prova de conceito
+de smartphone, esta versão ainda deve ser interpretada como uma **prova de conceito**
 e precisa de validação externa antes de qualquer aplicação clínica real.
+
+A saída do sistema deve ser interpretada apenas como apoio à triagem inicial.
 """
 )
