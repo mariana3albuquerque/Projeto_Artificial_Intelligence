@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import streamlit as st
 import tensorflow as tf
-from PIL import Image
+from PIL import Image, ImageDraw
 from tensorflow import keras
 
 
@@ -64,6 +65,7 @@ CLASS_DESCRIPTIONS_PT: Dict[str, str] = {
 }
 
 DEFAULT_MELANOMA_THRESHOLD = 0.36
+MEL_INDEX = CLASS_NAMES.index("mel")
 
 
 # ============================================================
@@ -72,24 +74,15 @@ DEFAULT_MELANOMA_THRESHOLD = 0.36
 
 @st.cache_resource
 def load_trained_model(model_path: str) -> keras.Model:
-    """
-    Carrega o modelo treinado da Sprint 3.
-    O cache evita recarregar o modelo a cada interação da interface.
-    """
     path = Path(model_path)
 
     if not path.exists():
         raise FileNotFoundError(f"Modelo não encontrado em: {path}")
 
-    model = keras.models.load_model(path)
-    return model
+    return keras.models.load_model(path)
 
 
 def load_decision_policy(policy_path: Path) -> Dict[str, float]:
-    """
-    Carrega a política de decisão, incluindo o threshold de melanoma.
-    Caso o arquivo não exista, utiliza o threshold padrão.
-    """
     if not policy_path.exists():
         return {"melanoma_threshold": DEFAULT_MELANOMA_THRESHOLD}
 
@@ -107,13 +100,6 @@ def load_decision_policy(policy_path: Path) -> Dict[str, float]:
 
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
-    """
-    Pré-processa a imagem enviada pelo usuário.
-
-    O modelo v2 foi treinado com imagens RGB redimensionadas para 224x224.
-    A camada de preprocessamento da EfficientNet foi incluída no modelo treinado,
-    então aqui mantemos os pixels em escala 0-255 como float32.
-    """
     image = image.convert("RGB")
     image = image.resize(IMAGE_SIZE)
 
@@ -128,16 +114,6 @@ def predict_image(
     image: Image.Image,
     melanoma_threshold: float,
 ) -> Tuple[str, float, Dict[str, float], str, float]:
-    """
-    Executa a predição e aplica a regra melanoma-sensitive.
-
-    Retorna:
-    - classe final após aplicar threshold;
-    - probabilidade da classe final;
-    - probabilidades por classe;
-    - classe original pelo argmax;
-    - probabilidade de melanoma.
-    """
     input_array = preprocess_image(image)
 
     probabilities = model.predict(input_array, verbose=0)[0]
@@ -171,9 +147,6 @@ def get_triage_message(
     melanoma_prob: float,
     melanoma_threshold: float,
 ) -> str:
-    """
-    Gera uma interpretação simples para o usuário.
-    """
     if final_class == "mel":
         return (
             "A imagem foi marcada como suspeita para melanoma pela regra "
@@ -193,9 +166,6 @@ def get_triage_message(
 
 
 def render_class_probabilities(probs_by_class: Dict[str, float]) -> None:
-    """
-    Exibe as probabilidades por classe em ordem decrescente.
-    """
     st.markdown("---")
     st.markdown("## Probabilidades por classe")
 
@@ -220,6 +190,270 @@ def render_class_probabilities(probs_by_class: Dict[str, float]) -> None:
             f"{rank}. **{class_name}** — {CLASS_DESCRIPTIONS_PT[class_name]} "
             f"({format_percentage(prob)})"
         )
+
+
+# ============================================================
+# Grad-CAM e bounding box aproximada
+# ============================================================
+
+def find_last_conv_layer(model: keras.Model) -> str:
+    """
+    Tenta encontrar automaticamente a última camada convolucional 4D.
+    """
+    for layer in reversed(model.layers):
+        try:
+            output_shape = layer.output.shape
+            if len(output_shape) == 4:
+                return layer.name
+        except Exception:
+            continue
+
+    raise ValueError(
+        "Não foi possível encontrar automaticamente uma camada convolucional 4D."
+    )
+
+
+def make_gradcam_heatmap(
+    input_array: np.ndarray,
+    model: keras.Model,
+    last_conv_layer_name: str,
+    pred_index: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Gera um heatmap Grad-CAM para a classe indicada.
+    """
+    grad_model = tf.keras.models.Model(
+        inputs=[model.inputs],
+        outputs=[
+            model.get_layer(last_conv_layer_name).output,
+            model.output,
+        ],
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(input_array)
+
+        if pred_index is None:
+            pred_index = tf.argmax(predictions[0])
+
+        class_channel = predictions[:, pred_index]
+
+    grads = tape.gradient(class_channel, conv_outputs)
+
+    if grads is None:
+        raise ValueError("Não foi possível calcular os gradientes para o Grad-CAM.")
+
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+
+    heatmap = tf.maximum(heatmap, 0)
+    max_value = tf.reduce_max(heatmap)
+
+    if max_value == 0:
+        return np.zeros_like(heatmap.numpy())
+
+    heatmap = heatmap / max_value
+    return heatmap.numpy()
+
+
+def overlay_heatmap_on_image(
+    original_image: Image.Image,
+    heatmap: np.ndarray,
+    alpha: float = 0.40,
+) -> Image.Image:
+    """
+    Sobrepõe o heatmap na imagem original.
+    """
+    image = original_image.convert("RGB")
+    image_np = np.array(image)
+
+    heatmap_resized = cv2.resize(
+        heatmap,
+        (image_np.shape[1], image_np.shape[0]),
+    )
+
+    heatmap_uint8 = np.uint8(255 * heatmap_resized)
+
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+
+    overlay = cv2.addWeighted(
+        image_np,
+        1 - alpha,
+        heatmap_color,
+        alpha,
+        0,
+    )
+
+    return Image.fromarray(overlay)
+
+
+def extract_bounding_box_from_heatmap(
+    heatmap: np.ndarray,
+    original_size: Tuple[int, int],
+    threshold: float = 0.60,
+) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Extrai uma bounding box aproximada a partir da região mais ativada do heatmap.
+
+    Observação:
+    Isso não é uma detecção treinada nem segmentação clínica. É apenas uma
+    aproximação visual a partir do Grad-CAM.
+    """
+    width, height = original_size
+
+    heatmap_resized = cv2.resize(heatmap, (width, height))
+    mask = heatmap_resized >= threshold
+
+    coords = np.argwhere(mask)
+
+    if coords.size == 0:
+        return None
+
+    y_min, x_min = coords.min(axis=0)
+    y_max, x_max = coords.max(axis=0)
+
+    return int(x_min), int(y_min), int(x_max), int(y_max)
+
+
+def draw_bounding_box(
+    image: Image.Image,
+    bbox: Optional[Tuple[int, int, int, int]],
+    label: str,
+) -> Image.Image:
+    image = image.convert("RGB").copy()
+
+    if bbox is None:
+        return image
+
+    draw = ImageDraw.Draw(image)
+    x_min, y_min, x_max, y_max = bbox
+
+    draw.rectangle(
+        [x_min, y_min, x_max, y_max],
+        outline="red",
+        width=5,
+    )
+
+    text_y = max(0, y_min - 24)
+    draw.text((x_min, text_y), label, fill="red")
+
+    return image
+
+
+def render_gradcam_section(
+    model: keras.Model,
+    image: Image.Image,
+    final_class: str,
+) -> None:
+    """
+    Renderiza Grad-CAM da classe final e Grad-CAM específico para melanoma.
+    """
+    st.markdown("---")
+    st.markdown("## Interpretabilidade visual")
+
+    st.info(
+        "A visualização abaixo usa Grad-CAM para mostrar regiões que influenciaram "
+        "a decisão do modelo. A bounding box é aproximada e derivada do heatmap. "
+        "Isso não equivale a segmentação clínica real da lesão."
+    )
+
+    try:
+        last_conv_layer_name = find_last_conv_layer(model)
+        input_array = preprocess_image(image)
+
+        final_class_index = CLASS_NAMES.index(final_class)
+
+        heatmap_final = make_gradcam_heatmap(
+            input_array=input_array,
+            model=model,
+            last_conv_layer_name=last_conv_layer_name,
+            pred_index=final_class_index,
+        )
+
+        overlay_final = overlay_heatmap_on_image(
+            original_image=image,
+            heatmap=heatmap_final,
+            alpha=0.40,
+        )
+
+        bbox_final = extract_bounding_box_from_heatmap(
+            heatmap=heatmap_final,
+            original_size=image.size,
+            threshold=0.60,
+        )
+
+        boxed_final = draw_bounding_box(
+            image=image,
+            bbox=bbox_final,
+            label=f"Região: {final_class}",
+        )
+
+        heatmap_mel = make_gradcam_heatmap(
+            input_array=input_array,
+            model=model,
+            last_conv_layer_name=last_conv_layer_name,
+            pred_index=MEL_INDEX,
+        )
+
+        overlay_mel = overlay_heatmap_on_image(
+            original_image=image,
+            heatmap=heatmap_mel,
+            alpha=0.40,
+        )
+
+        bbox_mel = extract_bounding_box_from_heatmap(
+            heatmap=heatmap_mel,
+            original_size=image.size,
+            threshold=0.60,
+        )
+
+        boxed_mel = draw_bounding_box(
+            image=image,
+            bbox=bbox_mel,
+            label="Região: melanoma",
+        )
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            st.image(
+                overlay_final,
+                caption=f"Grad-CAM da classe final ({final_class})",
+                use_container_width=True,
+            )
+
+        with col_b:
+            st.image(
+                boxed_final,
+                caption=f"Bounding box aproximada da classe final ({final_class})",
+                use_container_width=True,
+            )
+
+        col_c, col_d = st.columns(2)
+
+        with col_c:
+            st.image(
+                overlay_mel,
+                caption="Grad-CAM específico para melanoma",
+                use_container_width=True,
+            )
+
+        with col_d:
+            st.image(
+                boxed_mel,
+                caption="Bounding box aproximada para melanoma",
+                use_container_width=True,
+            )
+
+    except Exception as exc:
+        st.warning(
+            "Não foi possível gerar o Grad-CAM automaticamente para este modelo."
+        )
+        st.exception(exc)
 
 
 # ============================================================
@@ -251,6 +485,7 @@ Este sistema é apenas uma prova de conceito acadêmica. Ele não fornece diagn�
 não substitui dermatologistas e não deve ser usado como ferramenta clínica definitiva.
 """
 )
+
 
 # ============================================================
 # Sidebar
@@ -293,6 +528,7 @@ with st.sidebar:
         st.write(
             f"**{class_name}** — {CLASS_DESCRIPTIONS_PT[class_name]}"
         )
+
 
 # ============================================================
 # Upload da imagem
@@ -387,9 +623,16 @@ else:
 
             render_class_probabilities(probs_by_class)
 
+            render_gradcam_section(
+                model=model,
+                image=image,
+                final_class=final_class,
+            )
+
         except Exception as exc:
             st.error("Não foi possível executar a predição.")
             st.exception(exc)
+
 
 # ============================================================
 # Observação metodológica
@@ -405,6 +648,10 @@ O modelo foi treinado inicialmente com o dataset **HAM10000**, composto por imag
 dermatoscópicas. Portanto, embora o projeto tenha como visão futura o uso com imagens
 de smartphone, esta versão ainda deve ser interpretada como uma **prova de conceito**
 e precisa de validação externa antes de qualquer aplicação clínica real.
+
+O modelo atual realiza **classificação da imagem inteira**. A visualização Grad-CAM
+ajuda a indicar quais regiões influenciaram a decisão, mas não substitui uma etapa de
+segmentação clínica da lesão.
 
 A saída do sistema deve ser interpretada apenas como apoio à triagem inicial.
 """
