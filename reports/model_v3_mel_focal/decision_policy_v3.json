@@ -1,0 +1,16 @@
+{
+  "melanoma_threshold": 0.23,
+  "target_melanoma_recall": 0.8,
+  "min_melanoma_precision": 0.25,
+  "melanoma_boost": 2.5,
+  "label_smoothing": 0.01,
+  "fine_tune_layers": 60,
+  "use_focal_loss": true,
+  "focal_gamma": 2.0,
+  "image_size": [
+    224,
+    224
+  ],
+  "architecture": "EfficientNetB0",
+  "task": "melanoma-sensitive triage v3"
+}

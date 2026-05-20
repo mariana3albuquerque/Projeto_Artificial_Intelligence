@@ -21,15 +21,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL_PATH = (
     PROJECT_ROOT
     / "reports"
-    / "model_v2_mel_sensitive_final"
-    / "cnn_ham10000_v2.keras"
+    / "model_v3_mel_focal"
+    / "cnn_ham10000_v3.keras"
 )
 
 DEFAULT_POLICY_PATH = (
     PROJECT_ROOT
     / "reports"
-    / "model_v2_mel_sensitive_final"
-    / "decision_policy_v2.json"
+    / "model_v3_mel_focal"
+    / "decision_policy_v3.json"
 )
 
 IMAGE_SIZE = (224, 224)
@@ -79,7 +79,8 @@ def load_trained_model(model_path: str) -> keras.Model:
     if not path.exists():
         raise FileNotFoundError(f"Modelo não encontrado em: {path}")
 
-    return keras.models.load_model(path)
+    # compile=False evita erro ao carregar modelos com loss customizada (focal loss v3)
+    return keras.models.load_model(path, compile=False)
 
 
 def load_decision_policy(policy_path: Path) -> Dict[str, float]:
@@ -196,67 +197,157 @@ def render_class_probabilities(probs_by_class: Dict[str, float]) -> None:
 # Grad-CAM e bounding box aproximada
 # ============================================================
 
-def find_last_conv_layer(model: keras.Model) -> str:
+def find_last_conv_layer(
+    model: keras.Model,
+) -> Tuple[Optional[keras.Model], str]:
     """
-    Tenta encontrar automaticamente a última camada convolucional 4D.
+    Encontra a última camada convolucional 4D.
+    Busca primeiro nas camadas top-level; se não achar, desce para backbones
+    aninhados (ex.: EfficientNetB0 com pooling='avg' que absorve o GAP interno).
+    Retorna (backbone_layer_or_None, layer_name).
     """
     for layer in reversed(model.layers):
         try:
-            output_shape = layer.output.shape
-            if len(output_shape) == 4:
-                return layer.name
+            if len(layer.output.shape) == 4:
+                return None, layer.name
         except Exception:
             continue
+
+    for layer in reversed(model.layers):
+        if not isinstance(layer, keras.Model):
+            continue
+        for sub_layer in reversed(layer.layers):
+            try:
+                if len(sub_layer.output.shape) == 4:
+                    return layer, sub_layer.name
+            except Exception:
+                continue
 
     raise ValueError(
         "Não foi possível encontrar automaticamente uma camada convolucional 4D."
     )
+
+def _build_gradcam_model(
+    model: keras.Model,
+    backbone: Optional[keras.Model],
+    last_conv_layer_name: str,
+) -> keras.Model:
+    """
+    Constrói um modelo que emite [conv_activation, predicao_final].
+
+    O problema com backbone aninhado (EfficientNetB0 com pooling='avg'):
+    backbone.get_layer(name).output retorna um tensor do grafo INTERNO do
+    backbone, não acessível a partir de model.inputs. A solução é reconstruir
+    o modelo camada a camada, substituindo o backbone por uma versão dual que
+    expõe simultaneamente o tensor conv e o output pooled.
+    """
+    if backbone is None:
+        return tf.keras.models.Model(
+            inputs=model.inputs,
+            outputs=[model.get_layer(last_conv_layer_name).output, model.output],
+        )
+
+    backbone_dual = tf.keras.models.Model(
+        inputs=backbone.inputs,
+        outputs=[
+            backbone.get_layer(last_conv_layer_name).output,
+            backbone.output,
+        ],
+    )
+
+    new_input = keras.Input(shape=model.input.shape[1:])
+    x = new_input
+    conv_tensor = None
+
+    for layer in model.layers:
+        if isinstance(layer, keras.layers.InputLayer):
+            continue
+        if layer.name == backbone.name:
+            conv_tensor, x = backbone_dual(x, training=False)
+        else:
+            try:
+                x = layer(x, training=False)
+            except TypeError:
+                x = layer(x)
+
+    return keras.models.Model(inputs=new_input, outputs=[conv_tensor, x])
 
 
 def make_gradcam_heatmap(
     input_array: np.ndarray,
     model: keras.Model,
     last_conv_layer_name: str,
+    backbone: Optional[keras.Model] = None,
     pred_index: Optional[int] = None,
 ) -> np.ndarray:
     """
-    Gera um heatmap Grad-CAM para a classe indicada.
+    Gera Grad-CAM. Levanta ValueError se não conseguir, para o chamador
+    usar saliency map como fallback.
     """
-    grad_model = tf.keras.models.Model(
-        inputs=[model.inputs],
-        outputs=[
-            model.get_layer(last_conv_layer_name).output,
-            model.output,
-        ],
-    )
+    try:
+        grad_model = _build_gradcam_model(model, backbone, last_conv_layer_name)
+
+        with tf.GradientTape() as tape:
+            conv_outputs, predictions = grad_model(input_array, training=False)
+
+            if pred_index is None:
+                pred_index = tf.argmax(predictions[0])
+
+            class_channel = predictions[:, pred_index]
+
+        grads = tape.gradient(class_channel, conv_outputs)
+
+        if grads is None:
+            raise ValueError("Gradientes nulos para Grad-CAM.")
+
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+        heatmap = conv_outputs[0] @ pooled_grads[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
+        heatmap = tf.maximum(heatmap, 0)
+        max_value = tf.reduce_max(heatmap)
+
+        if max_value == 0:
+            raise ValueError("Heatmap Grad-CAM vazio.")
+
+        return (heatmap / max_value).numpy()
+
+    except Exception as exc:
+        raise ValueError(
+            "Não foi possível gerar Grad-CAM com a arquitetura salva. "
+            "Use saliency map como fallback."
+        ) from exc
+    
+def make_saliency_heatmap(
+    input_array: np.ndarray,
+    model: keras.Model,
+    pred_index: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Gera um mapa de saliência baseado no gradiente da classe em relação à imagem.
+    Funciona mesmo quando Grad-CAM não consegue acessar uma camada convolucional.
+    """
+    input_tensor = tf.convert_to_tensor(input_array)
 
     with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(input_array)
+        tape.watch(input_tensor)
+        predictions = model(input_tensor, training=False)
 
         if pred_index is None:
             pred_index = tf.argmax(predictions[0])
 
-        class_channel = predictions[:, pred_index]
+        class_score = predictions[:, pred_index]
 
-    grads = tape.gradient(class_channel, conv_outputs)
+    grads = tape.gradient(class_score, input_tensor)
 
     if grads is None:
-        raise ValueError("Não foi possível calcular os gradientes para o Grad-CAM.")
+        raise ValueError("Não foi possível calcular saliency map.")
 
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    saliency = tf.reduce_max(tf.abs(grads), axis=-1)[0]
 
-    conv_outputs = conv_outputs[0]
-    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
+    saliency = saliency - tf.reduce_min(saliency)
+    saliency = saliency / (tf.reduce_max(saliency) + 1e-8)
 
-    heatmap = tf.maximum(heatmap, 0)
-    max_value = tf.reduce_max(heatmap)
-
-    if max_value == 0:
-        return np.zeros_like(heatmap.numpy())
-
-    heatmap = heatmap / max_value
-    return heatmap.numpy()
+    return saliency.numpy()
 
 
 def overlay_heatmap_on_image(
@@ -294,27 +385,41 @@ def overlay_heatmap_on_image(
 def extract_bounding_box_from_heatmap(
     heatmap: np.ndarray,
     original_size: Tuple[int, int],
-    threshold: float = 0.60,
+    threshold: float = 0.50,
+    padding_pct: float = 0.03,
 ) -> Optional[Tuple[int, int, int, int]]:
     """
-    Extrai uma bounding box aproximada a partir da região mais ativada do heatmap.
-
-    Observação:
-    Isso não é uma detecção treinada nem segmentação clínica. É apenas uma
-    aproximação visual a partir do Grad-CAM.
+    Extrai bounding box a partir da região mais ativada do heatmap.
+    Aplica blur gaussiano antes do threshold para reduzir ruído, usa o maior
+    contorno para ignorar ativações espúrias, e adiciona padding proporcional.
     """
     width, height = original_size
 
     heatmap_resized = cv2.resize(heatmap, (width, height))
-    mask = heatmap_resized >= threshold
 
-    coords = np.argwhere(mask)
+    sigma = max(width, height) * 0.02
+    blurred = cv2.GaussianBlur(heatmap_resized, (0, 0), sigmaX=sigma)
+    h_min, h_max = blurred.min(), blurred.max()
+    if h_max - h_min > 1e-8:
+        blurred = (blurred - h_min) / (h_max - h_min)
 
-    if coords.size == 0:
+    mask = (blurred >= threshold).astype(np.uint8)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
         return None
 
-    y_min, x_min = coords.min(axis=0)
-    y_max, x_max = coords.max(axis=0)
+    largest = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(largest)
+
+    pad_x = int(width * padding_pct)
+    pad_y = int(height * padding_pct)
+
+    x_min = max(0, x - pad_x)
+    y_min = max(0, y - pad_y)
+    x_max = min(width, x + w + pad_x)
+    y_max = min(height, y + h + pad_y)
 
     return int(x_min), int(y_min), int(x_max), int(y_max)
 
@@ -350,111 +455,125 @@ def render_gradcam_section(
     final_class: str,
 ) -> None:
     """
-    Renderiza Grad-CAM da classe final e Grad-CAM específico para melanoma.
+    Renderiza Grad-CAM quando possível. Se Grad-CAM falhar, usa saliency map.
+    Também gera bounding box aproximada a partir do mapa de calor.
     """
     st.markdown("---")
     st.markdown("## Interpretabilidade visual")
 
     st.info(
-        "A visualização abaixo usa Grad-CAM para mostrar regiões que influenciaram "
-        "a decisão do modelo. A bounding box é aproximada e derivada do heatmap. "
-        "Isso não equivale a segmentação clínica real da lesão."
+        "A visualização abaixo mostra regiões que influenciaram a decisão do modelo. "
+        "Quando Grad-CAM não está disponível para a arquitetura salva, o app usa "
+        "um saliency map baseado em gradientes da imagem. A bounding box é aproximada "
+        "e não equivale a segmentação clínica real da lesão."
     )
 
-    try:
-        last_conv_layer_name = find_last_conv_layer(model)
-        input_array = preprocess_image(image)
+    input_array = preprocess_image(image)
+    final_class_index = CLASS_NAMES.index(final_class)
 
-        final_class_index = CLASS_NAMES.index(final_class)
+    try:
+        backbone, last_conv_layer_name = find_last_conv_layer(model)
 
         heatmap_final = make_gradcam_heatmap(
             input_array=input_array,
             model=model,
             last_conv_layer_name=last_conv_layer_name,
+            backbone=backbone,
             pred_index=final_class_index,
         )
 
-        overlay_final = overlay_heatmap_on_image(
-            original_image=image,
-            heatmap=heatmap_final,
-            alpha=0.40,
-        )
+        method_final = "Grad-CAM"
 
-        bbox_final = extract_bounding_box_from_heatmap(
-            heatmap=heatmap_final,
-            original_size=image.size,
-            threshold=0.60,
-        )
-
-        boxed_final = draw_bounding_box(
-            image=image,
-            bbox=bbox_final,
-            label=f"Região: {final_class}",
-        )
-
-        heatmap_mel = make_gradcam_heatmap(
+    except Exception:
+        heatmap_final = make_saliency_heatmap(
             input_array=input_array,
             model=model,
-            last_conv_layer_name=last_conv_layer_name,
+            pred_index=final_class_index,
+        )
+
+        method_final = "Saliency map"
+
+    try:
+        heatmap_mel = make_saliency_heatmap(
+            input_array=input_array,
+            model=model,
             pred_index=MEL_INDEX,
         )
 
-        overlay_mel = overlay_heatmap_on_image(
-            original_image=image,
-            heatmap=heatmap_mel,
-            alpha=0.40,
-        )
-
-        bbox_mel = extract_bounding_box_from_heatmap(
-            heatmap=heatmap_mel,
-            original_size=image.size,
-            threshold=0.60,
-        )
-
-        boxed_mel = draw_bounding_box(
-            image=image,
-            bbox=bbox_mel,
-            label="Região: melanoma",
-        )
-
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            st.image(
-                overlay_final,
-                caption=f"Grad-CAM da classe final ({final_class})",
-                use_container_width=True,
-            )
-
-        with col_b:
-            st.image(
-                boxed_final,
-                caption=f"Bounding box aproximada da classe final ({final_class})",
-                use_container_width=True,
-            )
-
-        col_c, col_d = st.columns(2)
-
-        with col_c:
-            st.image(
-                overlay_mel,
-                caption="Grad-CAM específico para melanoma",
-                use_container_width=True,
-            )
-
-        with col_d:
-            st.image(
-                boxed_mel,
-                caption="Bounding box aproximada para melanoma",
-                use_container_width=True,
-            )
+        method_mel = "Saliency map específico para melanoma"
 
     except Exception as exc:
-        st.warning(
-            "Não foi possível gerar o Grad-CAM automaticamente para este modelo."
-        )
+        st.warning("Não foi possível gerar mapa de interpretabilidade para melanoma.")
         st.exception(exc)
+        return
 
+    overlay_final = overlay_heatmap_on_image(
+        original_image=image,
+        heatmap=heatmap_final,
+        alpha=0.40,
+    )
+
+    bbox_final = extract_bounding_box_from_heatmap(
+        heatmap=heatmap_final,
+        original_size=image.size,
+        threshold=0.60,
+    )
+
+    boxed_final = draw_bounding_box(
+        image=image,
+        bbox=bbox_final,
+        label=f"Região: {final_class}",
+    )
+
+    overlay_mel = overlay_heatmap_on_image(
+        original_image=image,
+        heatmap=heatmap_mel,
+        alpha=0.40,
+    )
+
+    bbox_mel = extract_bounding_box_from_heatmap(
+        heatmap=heatmap_mel,
+        original_size=image.size,
+        threshold=0.60,
+    )
+
+    boxed_mel = draw_bounding_box(
+        image=image,
+        bbox=bbox_mel,
+        label="Região: melanoma",
+    )
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.image(
+            overlay_final,
+            caption=f"{method_final} da classe final ({final_class})",
+            use_container_width=True,
+        )
+
+    with col_b:
+        st.image(
+            boxed_final,
+            caption=f"Bounding box aproximada da classe final ({final_class})",
+            use_container_width=True,
+        )
+
+    col_c, col_d = st.columns(2)
+
+    with col_c:
+        st.image(
+            overlay_mel,
+            caption=method_mel,
+            use_container_width=True,
+        )
+
+    with col_d:
+        st.image(
+            boxed_mel,
+            caption="Bounding box aproximada para melanoma",
+            use_container_width=True,
+        )
 
 # ============================================================
 # Interface Streamlit
